@@ -135,6 +135,11 @@ defmodule TermUI.Backend.SSHTest do
       assert output =~ "\e[H"
     end
 
+    test "disables autowrap on init" do
+      {_state, device} = init_ssh()
+      assert device_output(device) =~ "\e[?7l"
+    end
+
     test "enables mouse tracking when requested" do
       {state, device} = init_ssh(mouse_tracking: :click)
       assert state.mouse_mode == :click
@@ -185,6 +190,13 @@ defmodule TermUI.Backend.SSHTest do
       SSH.shutdown(state)
       {_input, output} = StringIO.contents(device)
       assert output =~ "\e[?1000l"
+    end
+
+    test "restores autowrap on shutdown" do
+      {state, device} = init_ssh()
+      SSH.shutdown(state)
+      {_input, output} = StringIO.contents(device)
+      assert output =~ "\e[?7h"
     end
 
     test "handles closed device gracefully" do
@@ -396,6 +408,39 @@ defmodule TermUI.Backend.SSHTest do
       assert output =~ "i"
     end
 
+    test "clears each touched row before drawing" do
+      {state, _device} = init_ssh()
+      {:ok, device} = StringIO.open("")
+      state = %{state | device: device}
+
+      cells = [
+        {{1, 1}, {"A", :default, :default, []}},
+        {{2, 1}, {"B", :default, :default, []}}
+      ]
+
+      {:ok, _state} = SSH.draw_cells(state, cells)
+
+      output = device_output(device)
+      assert String.contains?(output, "\e[1;1H\e[2K")
+      assert String.contains?(output, "\e[2;1H\e[2K")
+    end
+
+    test "does not emit per-cell cursor moves for contiguous cells" do
+      {state, _device} = init_ssh()
+      {:ok, device} = StringIO.open("")
+      state = %{state | device: device}
+
+      cells = [
+        {{1, 1}, {"H", :default, :default, []}},
+        {{1, 2}, {"i", :default, :default, []}}
+      ]
+
+      {:ok, _state} = SSH.draw_cells(state, cells)
+
+      output = device_output(device)
+      refute String.contains?(output, "\e[1;2H")
+    end
+
     test "emits SGR for colored text" do
       {state, _device} = init_ssh()
       {:ok, device} = StringIO.open("")
@@ -463,6 +508,24 @@ defmodule TermUI.Backend.SSHTest do
 
       output = device_output(device)
       assert output =~ " "
+    end
+
+    test "skips drawing the bottom-right cell to avoid terminal scroll edge cases" do
+      {state, _device} = init_ssh(size: {2, 2})
+      {:ok, device} = StringIO.open("")
+      state = %{state | device: device}
+
+      cells = [
+        {{2, 1}, {"C", :default, :default, []}},
+        {{2, 2}, {"D", :default, :default, []}}
+      ]
+
+      {:ok, new_state} = SSH.draw_cells(state, cells)
+
+      output = device_output(device)
+      assert output =~ "C"
+      refute output =~ "D"
+      assert new_state.cursor_position == {2, 2}
     end
   end
 

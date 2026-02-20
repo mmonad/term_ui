@@ -69,6 +69,7 @@ defmodule TermUI.Runtime do
           | {:backend, :auto | :raw | :tty}
           | {:skip_terminal, boolean()}
           | {:use_input_handler, boolean()}
+          | {:background, Cell.t()}
 
   # Default render interval in milliseconds (~60 FPS)
   @default_render_interval 16
@@ -302,21 +303,25 @@ defmodule TermUI.Runtime do
     root_module = Keyword.fetch!(opts, :root)
     render_interval = Keyword.get(opts, :render_interval, @default_render_interval)
 
-    # Suppress default Logger handler to prevent bare \n writes to stdout
-    # during raw mode (Logger output corrupts TUI rendering)
-    logger_handler_config =
-      if Keyword.get(opts, :skip_terminal, false) do
-        nil
-      else
-        suppress_logger()
-      end
-
     {backend_mode, backend, backend_state, capabilities, terminal_started, buffer_manager,
      dimensions} =
-      init_backend(opts)
+      init_backend(opts, unique_buffer_manager_name())
 
-    # Store backend info in persistent_term for global access
-    PersistentTerms.store_backend_context(backend_mode, capabilities)
+    # Suppress default Logger handler only for local terminal backends.
+    # Custom backends (e.g. SSH) should not mutate global logger handlers.
+    logger_handler_config =
+      if backend_mode in [:raw, :tty] and not Keyword.get(opts, :skip_terminal, false) do
+        suppress_logger()
+      else
+        nil
+      end
+
+    # Store backend info in persistent_term only for local terminal runtimes.
+    # Custom runtimes (SSH) must not override global terminal context used by
+    # the local UI runtime.
+    if backend_mode in [:raw, :tty, :skip] do
+      PersistentTerms.store_backend_context(backend_mode, capabilities)
+    end
 
     # Initialize root component state
     root_state = root_module.init(opts)
@@ -343,7 +348,8 @@ defmodule TermUI.Runtime do
         capabilities: capabilities,
         input_handler: input_handler,
         input_state: input_state,
-        logger_handler_config: logger_handler_config
+        logger_handler_config: logger_handler_config,
+        background: Keyword.get(opts, :background)
       })
 
     # Schedule first render
@@ -363,14 +369,14 @@ defmodule TermUI.Runtime do
     {:ok, state}
   end
 
-  defp init_backend(opts) do
+  defp init_backend(opts, buffer_manager_name) do
     skip_terminal = Keyword.get(opts, :skip_terminal, false)
     backend_opt = Keyword.get(opts, :backend, :auto)
 
     if skip_terminal do
       {:skip, nil, nil, nil, false, nil, nil}
     else
-      select_backend(backend_opt)
+      select_backend(backend_opt, buffer_manager_name)
     end
   end
 
@@ -435,22 +441,32 @@ defmodule TermUI.Runtime do
       capabilities: params.capabilities,
       input_handler: params.input_handler,
       input_state: params.input_state,
-      logger_handler_config: params[:logger_handler_config]
+      logger_handler_config: params[:logger_handler_config],
+      background: params[:background]
     }
   end
 
-  defp select_backend(backend_opt) do
+  defp select_backend(backend_opt, buffer_manager_name) do
     case Selector.select(backend_opt) do
-      {:raw, _raw_state} -> attempt_raw_backend(fallback_to_tty: true)
-      {:tty, capabilities} -> init_tty_backend(capabilities)
-      {:explicit, :raw, _opts} -> attempt_raw_backend(fallback_to_tty: false)
-      {:explicit, :tty, _opts} -> init_tty_backend(Selector.detect_capabilities())
-      {:explicit, module, opts} -> init_explicit_backend(module, opts)
+      {:raw, _raw_state} ->
+        attempt_raw_backend(fallback_to_tty: true, buffer_manager_name: buffer_manager_name)
+
+      {:tty, capabilities} ->
+        init_tty_backend(capabilities)
+
+      {:explicit, :raw, _opts} ->
+        attempt_raw_backend(fallback_to_tty: false, buffer_manager_name: buffer_manager_name)
+
+      {:explicit, :tty, _opts} ->
+        init_tty_backend(Selector.detect_capabilities())
+
+      {:explicit, module, opts} ->
+        init_explicit_backend(module, opts, buffer_manager_name)
     end
   end
 
   defp attempt_raw_backend(opts) do
-    case setup_terminal_and_buffers() do
+    case setup_terminal_and_buffers(Keyword.fetch!(opts, :buffer_manager_name)) do
       {true, buffer_manager, dimensions} ->
         init_raw_backend(buffer_manager, dimensions)
 
@@ -489,21 +505,21 @@ defmodule TermUI.Runtime do
     {:tty, backend, backend_state, capabilities, false, nil, nil}
   end
 
-  defp init_explicit_backend(TermUI.Backend.Raw, _opts) do
-    attempt_raw_backend(fallback_to_tty: false)
+  defp init_explicit_backend(TermUI.Backend.Raw, _opts, buffer_manager_name) do
+    attempt_raw_backend(fallback_to_tty: false, buffer_manager_name: buffer_manager_name)
   end
 
-  defp init_explicit_backend(TermUI.Backend.TTY, _opts) do
+  defp init_explicit_backend(TermUI.Backend.TTY, _opts, _buffer_manager_name) do
     init_tty_backend(Selector.detect_capabilities())
   end
 
-  defp init_explicit_backend(module, opts) when is_atom(module) do
+  defp init_explicit_backend(module, opts, buffer_manager_name) when is_atom(module) do
     {:ok, backend_state} = module.init(opts)
     {:ok, {rows, cols}} = module.size(backend_state)
 
     # Start BufferManager for the custom backend
     buffer_pid =
-      case BufferManager.start_link(rows: rows, cols: cols) do
+      case BufferManager.start_link(rows: rows, cols: cols, name: buffer_manager_name) do
         {:ok, pid} -> pid
         {:error, {:already_started, pid}} -> pid
       end
@@ -511,7 +527,7 @@ defmodule TermUI.Runtime do
     {:custom, module, backend_state, nil, false, buffer_pid, {cols, rows}}
   end
 
-  defp setup_terminal_and_buffers do
+  defp setup_terminal_and_buffers(buffer_manager_name) do
     # Start Terminal GenServer (or reuse if already running)
     case Terminal.start_link() do
       {:ok, _pid} -> :ok
@@ -528,7 +544,7 @@ defmodule TermUI.Runtime do
 
     # Start BufferManager (or reuse if already running)
     buffer_pid =
-      case BufferManager.start_link(rows: rows, cols: cols) do
+      case BufferManager.start_link(rows: rows, cols: cols, name: buffer_manager_name) do
         {:ok, pid} -> pid
         {:error, {:already_started, pid}} -> pid
       end
@@ -545,6 +561,11 @@ defmodule TermUI.Runtime do
       {:ok, {rows, cols}} -> {rows, cols}
       {:error, _reason} -> {24, 80}
     end
+  end
+
+  @spec unique_buffer_manager_name() :: {:global, {:term_ui_buffer_manager, pid(), integer()}}
+  defp unique_buffer_manager_name do
+    {:global, {:term_ui_buffer_manager, self(), System.unique_integer([:positive])}}
   end
 
   @impl true
@@ -767,11 +788,16 @@ defmodule TermUI.Runtime do
     cleanup_shutdown(state)
     cleanup_terminal_restore(state)
 
-    # Step 5: Defensive cleanup (catches anything missed above)
-    terminate_defensive_cleanup()
+    # Step 5: Defensive cleanup (local terminals only)
+    if state.backend_mode in [:raw, :tty, :skip] do
+      terminate_defensive_cleanup()
+    end
 
-    # Step 6: Persistent terms and echo
-    cleanup_persistent_terms()
+    # Step 6: Persistent terms (local terminals only) and echo
+    if state.backend_mode in [:raw, :tty, :skip] do
+      cleanup_persistent_terms()
+    end
+
     ensure_echo_enabled(state)
 
     :ok
@@ -865,12 +891,17 @@ defmodule TermUI.Runtime do
     # Cleanup ONLCR persistent_term
     TerminalOutput.disable_onlcr()
 
-    # Safety net stty restore (skip on WSL where stty always fails)
-    unless TerminalOutput.needs_hard_reset?() do
+    # Safety net stty restore (skip if stdin is not a TTY, and on WSL).
+    unless TerminalOutput.needs_hard_reset?() or not stdin_tty?() do
       TermUI.TermUtils.safe_stty(["sane"])
     end
   rescue
     _ -> :ok
+  end
+
+  @spec stdin_tty?() :: boolean()
+  defp stdin_tty? do
+    match?({:ok, _}, :io.rows()) and match?({:ok, _}, :io.columns())
   end
 
   defp suppress_logger do
@@ -1180,8 +1211,15 @@ defmodule TermUI.Runtime do
       # Different rendering paths for Raw vs TTY backends
       {cells, new_backend_state} =
         if state.buffer_manager do
-          # Raw backend: use double buffering with diffing
-          render_with_buffer_manager(render_tree, state)
+          if state.backend_mode == :custom do
+            # Custom backends (SSH): redraw only changed rows.
+            # Each changed row is emitted as a full logical row to guarantee
+            # stale text is cleared without forcing full-screen repaints.
+            render_custom_with_buffer_manager(render_tree, state)
+          else
+            # Local raw backend: cell-level diffing for maximal efficiency.
+            render_with_buffer_manager(render_tree, state)
+          end
         else
           # TTY backend: create temporary buffer, render all cells
           render_to_tty_backend(render_tree, state)
@@ -1201,8 +1239,15 @@ defmodule TermUI.Runtime do
 
   # Renders using BufferManager with double buffering and diffing (Raw backend)
   defp render_with_buffer_manager(render_tree, state) do
-    # Clear current buffer
-    BufferManager.clear_current(state.buffer_manager)
+    # Fill current buffer: background cell if set, otherwise clear to empty.
+    # A non-default background ensures the diff draws all cells on the first
+    # frame, producing a full-screen render instead of content-only.
+    buffer = BufferManager.get_current_buffer(state.buffer_manager)
+
+    case state.background do
+      %Cell{} = bg -> Buffer.fill(buffer, bg)
+      _ -> BufferManager.clear_current(state.buffer_manager)
+    end
 
     # Render tree to buffer
     NodeRenderer.render_to_buffer(render_tree, state.buffer_manager)
@@ -1215,6 +1260,30 @@ defmodule TermUI.Runtime do
     cells = get_changed_cells(current, previous)
 
     # Swap buffers
+    BufferManager.swap_buffers(state.buffer_manager)
+
+    {cells, state.backend_state}
+  end
+
+  # Renders with BufferManager for custom backends (SSH).
+  # Emits complete changed rows (including spaces) so backends can safely
+  # clear and redraw touched rows without full-screen flicker.
+  defp render_custom_with_buffer_manager(render_tree, state) do
+    buffer = BufferManager.get_current_buffer(state.buffer_manager)
+
+    case state.background do
+      %Cell{} = bg -> Buffer.fill(buffer, bg)
+      _ -> BufferManager.clear_current(state.buffer_manager)
+    end
+
+    NodeRenderer.render_to_buffer(render_tree, state.buffer_manager)
+
+    current = BufferManager.get_current_buffer(state.buffer_manager)
+    previous = BufferManager.get_previous_buffer(state.buffer_manager)
+
+    changed_rows = changed_rows(current, previous)
+    cells = extract_rows_cells(current, changed_rows)
+
     BufferManager.swap_buffers(state.buffer_manager)
 
     {cells, state.backend_state}
@@ -1268,6 +1337,31 @@ defmodule TermUI.Runtime do
 
         cells_in_row ++ acc
     end
+  end
+
+  @spec extract_rows_cells(reference(), [pos_integer()]) :: list()
+  defp extract_rows_cells(_buffer, []), do: []
+
+  defp extract_rows_cells(buffer, rows) do
+    rows
+    |> Enum.reduce([], fn row, acc ->
+      row_cells =
+        buffer
+        |> Buffer.get_row(row)
+        |> Enum.with_index(1)
+        |> Enum.flat_map(fn {cell, col} -> cell_to_backend_tuple(cell, row, col) end)
+
+      row_cells ++ acc
+    end)
+  end
+
+  @spec changed_rows(reference(), reference()) :: [pos_integer()]
+  defp changed_rows(current, previous) do
+    {rows, _cols} = Buffer.dimensions(current)
+
+    for row <- 1..rows,
+        Buffer.get_row(current, row) != Buffer.get_row(previous, row),
+        do: row
   end
 
   # Gets changed cells by comparing current and previous buffers.

@@ -57,6 +57,7 @@ defmodule TermUI.Backend.SSH do
   @behaviour TermUI.Backend
 
   alias TermUI.ANSI
+  alias TermUI.Renderer.DisplayWidth
 
   # ANSI escape sequence constants
   @cursor_hide "\e[?25l"
@@ -65,6 +66,8 @@ defmodule TermUI.Backend.SSH do
   @cursor_home "\e[H"
   @alt_screen_enter "\e[?1049h"
   @alt_screen_leave "\e[?1049l"
+  @autowrap_off "\e[?7l"
+  @autowrap_on "\e[?7h"
   @reset_attrs "\e[0m"
 
   # Mouse tracking sequences
@@ -168,6 +171,10 @@ defmodule TermUI.Backend.SSH do
       device_write(device, @cursor_hide)
     end
 
+    # Disable autowrap to prevent bottom-right writes from scrolling the screen.
+    # This is important for diff renderers that frequently touch the right edge.
+    device_write(device, @autowrap_off)
+
     # Enable mouse tracking
     state = enable_mouse(state, mouse_tracking)
 
@@ -194,6 +201,9 @@ defmodule TermUI.Backend.SSH do
 
     # Show cursor
     device_write(device, @cursor_show)
+
+    # Restore terminal autowrap
+    device_write(device, @autowrap_on)
 
     # Leave alternate screen
     if state.alternate_screen do
@@ -277,32 +287,57 @@ defmodule TermUI.Backend.SSH do
   @doc """
   Draws cells to the SSH terminal at specified positions.
 
-  Uses style delta optimization — only emits SGR escape sequences when
-  the style changes from the previous cell. Cells should be sorted by
-  position (row-major) for efficient cursor movement.
+  Uses style delta optimization and row-based rendering:
+  - Clears each touched row once (`EL2`)
+  - Streams row content left-to-right
+  - Minimizes cursor movement within the row
+
+  This avoids stale-cell artifacts and reduces SSH output volume versus
+  absolute cursor movement per cell.
   """
   @spec draw_cells(t(), [{TermUI.Backend.position(), TermUI.Backend.cell()}]) :: {:ok, t()}
   def draw_cells(%__MODULE__{} = state, []), do: {:ok, state}
 
   def draw_cells(%__MODULE__{device: device} = state, cells) when is_list(cells) do
+    {max_rows, max_cols} = state.size
+
     # Sort cells by position for sequential rendering
     sorted = Enum.sort_by(cells, fn {{row, col}, _cell} -> {row, col} end)
 
-    # Render with style delta tracking
-    {iodata, new_style, last_pos} =
-      Enum.reduce(sorted, {[], state.current_style, state.cursor_position}, fn
-        {{row, col}, {char, fg, bg, attrs}}, {acc, prev_style, prev_pos} ->
-          # Cursor movement — skip if already at the right position
-          move_seq = cursor_move_sequence(prev_pos, {row, col})
+    # Render with style delta tracking.
+    # Track row-local cursor progression so adjacent cells don't need CUP.
+    {iodata, new_style, last_pos, _last_row, _next_col} =
+      Enum.reduce(sorted, {[], state.current_style, state.cursor_position, nil, 1}, fn
+        {{row, col}, {char, fg, bg, attrs}}, {acc, prev_style, _prev_pos, last_row, next_col} ->
+          {row_prefix, row_col} =
+            if last_row != row do
+              {["\e[#{row};1H", "\e[2K"], 1}
+            else
+              {[], next_col}
+            end
 
-          # Style delta — only emit changes
-          {style_seq, new_style} = style_delta_sequence(prev_style, fg, bg, attrs)
+          move_seq =
+            if col == row_col do
+              []
+            else
+              "\e[#{row};#{col}H"
+            end
 
-          # Sanitize character
-          safe_char = sanitize_char(char)
+          # Avoid emitting the bottom-right cell directly. Some terminals can
+          # still scroll or mis-handle this edge under latency/reflow.
+          if row == max_rows and col == max_cols do
+            new_acc = [acc, row_prefix]
+            {new_acc, prev_style, {row, col}, row, col}
+          else
+            {style_seq, new_style} = style_delta_sequence(prev_style, fg, bg, attrs)
+            safe_char = sanitize_char(char)
+            new_acc = [acc, row_prefix, move_seq, style_seq, safe_char]
 
-          new_acc = [acc, move_seq, style_seq, safe_char]
-          {new_acc, new_style, {row, col + String.length(safe_char)}}
+            width = max(1, DisplayWidth.width(safe_char))
+            next_col = col + width
+
+            {new_acc, new_style, {row, next_col}, row, next_col}
+          end
       end)
 
     # Flush all accumulated output in a single write
@@ -362,38 +397,6 @@ defmodule TermUI.Backend.SSH do
 
     device_write(device, seq)
     %{state | mouse_mode: mode}
-  end
-
-  # ===========================================================================
-  # Private — Cursor Movement
-  # ===========================================================================
-
-  # Generate minimal cursor movement sequence
-  @spec cursor_move_sequence(
-          {pos_integer(), pos_integer()} | nil,
-          {pos_integer(), pos_integer()}
-        ) :: iodata()
-  defp cursor_move_sequence(nil, {row, col}) do
-    "\e[#{row};#{col}H"
-  end
-
-  defp cursor_move_sequence({cur_row, cur_col}, {row, col}) do
-    cond do
-      cur_row == row and cur_col == col ->
-        []
-
-      cur_row == row and col == cur_col + 1 ->
-        # Next column — cursor advances naturally after char write
-        []
-
-      cur_row == row ->
-        # Same row, different column
-        "\e[#{row};#{col}H"
-
-      true ->
-        # Different row
-        "\e[#{row};#{col}H"
-    end
   end
 
   # ===========================================================================
@@ -496,5 +499,17 @@ defmodule TermUI.Backend.SSH do
 
   @spec sanitize_char(String.t()) :: String.t()
   defp sanitize_char(""), do: " "
-  defp sanitize_char(char), do: char
+
+  defp sanitize_char(char) when is_binary(char) do
+    char
+    |> String.graphemes()
+    |> List.first()
+    |> case do
+      nil ->
+        " "
+
+      grapheme ->
+        if Regex.match?(~r/[\x00-\x1F\x7F]/u, grapheme), do: " ", else: grapheme
+    end
+  end
 end
